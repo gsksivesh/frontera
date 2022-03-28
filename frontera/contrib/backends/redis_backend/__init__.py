@@ -446,7 +446,7 @@ class RedisBackend(DistributedBackend):
     def get_next_requests(self, max_next_requests, **kwargs):
         next_pages = []
         self._logger.debug("Querying queue table.")
-        partitions = set(kwargs.pop('partitions', []))
+        partitions = set(kwargs.pop('partitions', [0]))
         for partition_id in partitions:
             results = self.queue.get_next_requests(max_next_requests, partition_id,
                                                    min_hosts=self._min_hosts,
