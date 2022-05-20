@@ -69,7 +69,7 @@ class Decoder(BaseDecoder):
                                    meta=obj[4])
 
     def decode(self, buffer):
-        obj = unpackb(buffer, encoding='utf-8')
+        obj = unpackb(buffer, raw=False)
         if obj[0] == b'pc':
             return ('page_crawled',
                     self._response_from_object(obj[1]))
@@ -90,6 +90,6 @@ class Decoder(BaseDecoder):
         raise TypeError('Unknown message type')
 
     def decode_request(self, buffer):
-        return self._request_from_object(unpackb(buffer, encoding='utf-8'))
+        return self._request_from_object(unpackb(buffer, raw=False))
 
 

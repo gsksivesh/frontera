@@ -273,7 +273,7 @@ class DomainCache(LRUCache, DomainMetadata):
         for k, v in six.iteritems(row):
             cf, _, col = k.partition(b':')
             col = to_native_str(col)
-            value[col] = unpackb(v, encoding='utf-8')
+            value[col] = unpackb(v, raw=False)
             # XXX extract some fields as a set for faster in-checks
             if col in self._set_fields:
                 value[col] = set(value[col])
