@@ -75,11 +75,11 @@ class DBWorkerThreadComponent(DBWorkerBaseComponent):
         """Main entrypoint for the thread running loop."""
         while not self.stop_event.is_set():
             try:
-                is_backoff_needed = self.run()
+                self.run()
             except Exception:
                 self.logger.exception('Exception in the main loop')
             else:
-                if is_backoff_needed and self.run_backoff:
+                if self.run_backoff:
                     delay_msg = 'Sleep for {} seconds before next run()'
                     self.logger.debug(delay_msg.format(self.run_backoff))
                     time.sleep(self.run_backoff)
