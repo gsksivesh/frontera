@@ -86,12 +86,13 @@ class LRUCacheWithStats(LRUCache):
 class HBaseQueue(Queue):
     GET_RETRIES = 3
 
-    def __init__(self, connection_kwargs, partitions, table_name, drop=False, use_snappy=False):
+    def __init__(self, connection_kwargs, partitions, table_name, write_log_size, drop=False, use_snappy=False):
         self.connection = Connection(**connection_kwargs)
         self.partitions = [i for i in range(0, partitions)]
         self.partitioner = Crc32NamePartitioner(self.partitions)
         self.logger = logging.getLogger("hbase.queue")
         self.table_name = to_bytes(table_name)
+        self.write_log_size = write_log_size
 
         tables = set(self.connection.tables())
         if drop and self.table_name in tables:
@@ -178,23 +179,25 @@ class HBaseQueue(Queue):
             rk = "%d_%s_%d" % (partition_id, "%0.2f_%0.2f" % get_interval(score, 0.01), random_str)
             data.setdefault(rk, []).append((score, item))
 
-        table = self.connection.table(self.table_name)
-        with table.batch(transaction=True) as b:
-            for rk, tuples in six.iteritems(data):
-                obj = dict()
-                for score, item in tuples:
-                    column = 'f:%0.3f_%0.3f' % get_interval(score, 0.001)
-                    obj.setdefault(column, []).append(item)
+        self.connection.close()
+        self.connection.open()
+        table_batch = self.connection.table(self.table_name).batch(batch_size=self.write_log_size)
+        for rk, tuples in six.iteritems(data):
+            obj = dict()
+            for score, item in tuples:
+                column = 'f:%0.3f_%0.3f' % get_interval(score, 0.001)
+                obj.setdefault(column, []).append(item)
 
-                final = dict()
-                packer = Packer()
-                for column, items in six.iteritems(obj):
-                    stream = BytesIO()
-                    for item in items:
-                        stream.write(packer.pack(item))
-                    final[column] = stream.getvalue()
-                final[b'f:t'] = str(timestamp)
-                b.put(rk, final)
+            final = dict()
+            packer = Packer()
+            for column, items in six.iteritems(obj):
+                stream = BytesIO()
+                for item in items:
+                    stream.write(packer.pack(item))
+                final[column] = stream.getvalue()
+            final[b'f:t'] = str(timestamp)
+            table_batch.put(rk, final)
+        table_batch.send()
 
     def get_next_requests(self, max_n_requests, partition_id, **kwargs):
         """
@@ -212,7 +215,6 @@ class HBaseQueue(Queue):
         min_hosts = kwargs.pop('min_hosts', None)
         max_requests_per_host = kwargs.pop('max_requests_per_host', None)
         assert (max_n_requests > min_requests)
-        table = self.connection.table(self.table_name)
 
         meta_map = {}
         queue = {}
@@ -234,6 +236,9 @@ class HBaseQueue(Queue):
             # XXX pypy hot-fix: non-exhausted generator must be closed manually
             # otherwise "finally" piece in table.scan() method won't be executed
             # immediately to properly close scanner (http://pypy.org/compat.html)
+            self.connection.close()
+            self.connection.open()
+            table = self.connection.table(self.table_name)
             scan_gen = table.scan(limit=int(limit), batch_size=256, row_prefix=prefix, sorted_columns=True)
             try:
                 for rk, data in scan_gen:
@@ -290,9 +295,12 @@ class HBaseQueue(Queue):
                         results.append(request)
                     trash_can.add(rk)
 
-        with table.batch(transaction=True) as b:
-            for rk in trash_can:
-                b.delete(rk)
+        self.connection.close()
+        self.connection.open()
+        table_batch = self.connection.table(self.table_name).batch(batch_size=self.write_log_size)
+        for rk in trash_can:
+            table_batch.delete(rk)
+        table_batch.send()
         self.logger.debug("%d row keys removed", len(trash_can))
         return results
 
@@ -341,6 +349,8 @@ class HBaseState(States):
             obj.meta[b'state'] = self._state_cache.get(obj.meta[b'fingerprint'], States.DEFAULT)
 
     def flush(self):
+        self.connection.close()
+        self.connection.open()
         self._state_batch.send()
 
     def fetch(self, fingerprints):
@@ -353,6 +363,8 @@ class HBaseState(States):
                           len(to_fetch), len(fingerprints), len(self._state_cache))
         for chunk in chunks(to_fetch, 65536):
             keys = [unhexlify(fprint) for fprint in chunk]
+            self.connection.close()
+            self.connection.open()
             table = self.connection.table(self._table_name)
             records = table.rows(keys, columns=[b's:state'])
             for key, cells in records:
@@ -407,6 +419,8 @@ class HBaseMetadata(Metadata):
         self.flush()
 
     def flush(self):
+        self.connection.close()
+        self.connection.open()
         self.batch.send()
 
     def add_seeds(self, seeds):
@@ -511,7 +525,8 @@ class HBaseBackend(DistributedBackend):
     def _init_queue(self, settings):
         self._queue = HBaseQueue(self.connection_kwargs, self.queue_partitions,
                                  settings.get('HBASE_QUEUE_TABLE'), drop=settings.get('HBASE_DROP_ALL_TABLES'),
-                                 use_snappy=settings.get('HBASE_USE_SNAPPY'))
+                                 use_snappy=settings.get('HBASE_USE_SNAPPY'),
+                                 write_log_size=settings.get('HBASE_STATE_WRITE_LOG_SIZE'), )
 
     def _init_metadata(self, settings):
         self._metadata = HBaseMetadata(self.connection_kwargs, settings.get('HBASE_METADATA_TABLE'),
