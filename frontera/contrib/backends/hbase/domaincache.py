@@ -1,20 +1,19 @@
 from __future__ import absolute_import
 
+import collections
 import logging
 from collections import defaultdict
 from time import time
 
 import six
+from cachetools import Cache
+from happybase import Connection
 from msgpack import packb, unpackb
 from w3lib.util import to_bytes, to_native_str
 
-from frontera.core.components import DomainMetadata
 from frontera.contrib.backends.hbase.utils import HardenedBatch
+from frontera.core.components import DomainMetadata
 from frontera.utils.msgpack import restruct_for_pack
-
-import collections
-from cachetools import Cache
-
 
 DEFAULT_HBASE_THRIFT_FRAME_SIZE = 2097152
 
@@ -85,13 +84,14 @@ class DomainCache(LRUCache, DomainMetadata):
     MAX_VALUE_SIZE = int(DEFAULT_HBASE_THRIFT_FRAME_SIZE * 0.95)
     LOG_INTERVAL = 60.0
 
-    def __init__(self, maxsize, connection, table_name, set_fields=None, on_get_func=None, batch_size=100):
+    def __init__(self, maxsize, connection_kwards, table_name, set_fields=None, on_get_func=None, batch_size=100):
         super(DomainCache, self).__init__(maxsize)
 
         self._second_gen = dict()
 
         table_name = to_bytes(table_name)
-        self._table = self._get_domain_table(connection, table_name)
+        self.connection = Connection(**connection_kwards)
+        self._table = self._get_domain_table(self.connection, table_name)
         self._batch = HardenedBatch(self._table, batch_size=batch_size)
         self._set_fields = set(set_fields) if set_fields else set()
         self._on_get_func = on_get_func
@@ -124,7 +124,7 @@ class DomainCache(LRUCache, DomainMetadata):
                     self.__setitem__(key, value)
             else:
                 self.__setitem__(key, value)
-                if key in self._second_gen:   # the second gen clean up could be triggered during set in first gen
+                if key in self._second_gen:  # the second gen clean up could be triggered during set in first gen
                     del self._second_gen[key]
         else:
             self._update_order(key)

@@ -1,29 +1,30 @@
 # -*- coding: utf-8 -*-
 from __future__ import absolute_import, division
-from frontera import DistributedBackend
-from frontera.core.components import Metadata, Queue, States
-from frontera.core.models import Request
-from frontera.contrib.backends.partitioners import Crc32NamePartitioner
-from frontera.utils.misc import chunks, get_crc32, time_elapsed
-from frontera.contrib.backends.remote.codecs.msgpack import Decoder, Encoder
-from frontera.contrib.backends.hbase.domaincache import DomainCache
 
-from happybase import Connection
-from msgpack import Unpacker, Packer, packb
-import six
-from six.moves import range
-from w3lib.util import to_bytes
-from cachetools import LRUCache
-
-from struct import pack, unpack
-from datetime import datetime
-from calendar import timegm
-from time import time
+import logging
 from binascii import hexlify, unhexlify
+from calendar import timegm
+from collections import defaultdict, Iterable
+from datetime import datetime
 from io import BytesIO
 from random import choice
-from collections import defaultdict, Iterable
-import logging
+from struct import pack, unpack
+from time import time
+
+import six
+from cachetools import LRUCache
+from happybase import Connection
+from msgpack import Unpacker, Packer, packb
+from six.moves import range
+from w3lib.util import to_bytes
+
+from frontera import DistributedBackend
+from frontera.contrib.backends.hbase.domaincache import DomainCache
+from frontera.contrib.backends.partitioners import Crc32NamePartitioner
+from frontera.contrib.backends.remote.codecs.msgpack import Decoder, Encoder
+from frontera.core.components import Metadata, Queue, States
+from frontera.core.models import Request
+from frontera.utils.misc import chunks, get_crc32
 
 _pack_functions = {
     'url': to_bytes,
@@ -85,8 +86,8 @@ class LRUCacheWithStats(LRUCache):
 class HBaseQueue(Queue):
     GET_RETRIES = 3
 
-    def __init__(self, connection, partitions, table_name, drop=False, use_snappy=False):
-        self.connection = connection
+    def __init__(self, connection_kwargs, partitions, table_name, drop=False, use_snappy=False):
+        self.connection = Connection(**connection_kwargs)
         self.partitions = [i for i in range(0, partitions)]
         self.partitioner = Crc32NamePartitioner(self.partitions)
         self.logger = logging.getLogger("hbase.queue")
@@ -300,9 +301,9 @@ class HBaseQueue(Queue):
 
 
 class HBaseState(States):
-    def __init__(self, connection, table_name, cache_size_limit,
+    def __init__(self, connection_kwargs, table_name, cache_size_limit,
                  write_log_size, drop_all_tables):
-        self.connection = connection
+        self.connection = Connection(**connection_kwargs)
         self._table_name = to_bytes(table_name)
         self.logger = logging.getLogger("hbase.states")
         self._state_batch = self.connection.table(
@@ -312,16 +313,16 @@ class HBaseState(States):
                                               stats=self._state_stats)
         self._state_last_updates = 0
 
-        tables = set(connection.tables())
+        tables = set(self.connection.tables())
         if drop_all_tables and self._table_name in tables:
-            connection.delete_table(self._table_name, disable=True)
+            self.connection.delete_table(self._table_name, disable=True)
             tables.remove(self._table_name)
 
         if self._table_name not in tables:
             schema = {'s': {'max_versions': 1, 'block_cache_enabled': 1,
                             'bloom_filter_type': 'ROW', 'in_memory': True, }
                       }
-            connection.create_table(self._table_name, schema)
+            self.connection.create_table(self._table_name, schema)
 
     def update_cache(self, objs):
         objs = objs if isinstance(objs, Iterable) else [objs]
@@ -379,11 +380,12 @@ class HBaseState(States):
 
 
 class HBaseMetadata(Metadata):
-    def __init__(self, connection, table_name, drop_all_tables, use_snappy, batch_size, store_content):
+    def __init__(self, connection_kwargs, table_name, drop_all_tables, use_snappy, batch_size, store_content):
         self._table_name = to_bytes(table_name)
-        tables = set(connection.tables())
+        self.connection = Connection(**connection_kwargs)
+        tables = set(self.connection.tables())
         if drop_all_tables and self._table_name in tables:
-            connection.delete_table(self._table_name, disable=True)
+            self.connection.delete_table(self._table_name, disable=True)
             tables.remove(self._table_name)
 
         if self._table_name not in tables:
@@ -393,8 +395,8 @@ class HBaseMetadata(Metadata):
             if use_snappy:
                 schema['m']['compression'] = 'SNAPPY'
                 schema['c']['compression'] = 'SNAPPY'
-            connection.create_table(self._table_name, schema)
-        table = connection.table(self._table_name)
+            self.connection.create_table(self._table_name, schema)
+        table = self.connection.table(self._table_name)
         self.batch = table.batch(batch_size=batch_size)
         self.store_content = store_content
 
@@ -484,7 +486,7 @@ class HBaseBackend(DistributedBackend):
             'port': int(port),
             'table_prefix': namespace,
             'table_prefix_separator': ':',
-            'timeout': 60000
+            'timeout': 600000
         }
         if settings.get('HBASE_USE_FRAMED_COMPACT'):
             kwargs.update({
@@ -493,32 +495,33 @@ class HBaseBackend(DistributedBackend):
             })
         self.logger.info("Connecting to %s:%d thrift server.", host, port)
         self.connection = Connection(**kwargs)
+        self.connection_kwargs = kwargs
         self._metadata = None
         self._queue = None
         self._states = None
         self._domain_metadata = None
 
     def _init_states(self, settings):
-        self._states = HBaseState(connection=self.connection,
+        self._states = HBaseState(connection_kwargs=self.connection_kwargs,
                                   table_name=settings.get('HBASE_STATES_TABLE'),
                                   cache_size_limit=settings.get('HBASE_STATE_CACHE_SIZE_LIMIT'),
                                   write_log_size=settings.get('HBASE_STATE_WRITE_LOG_SIZE'),
                                   drop_all_tables=settings.get('HBASE_DROP_ALL_TABLES'))
 
     def _init_queue(self, settings):
-        self._queue = HBaseQueue(self.connection, self.queue_partitions,
+        self._queue = HBaseQueue(self.connection_kwargs, self.queue_partitions,
                                  settings.get('HBASE_QUEUE_TABLE'), drop=settings.get('HBASE_DROP_ALL_TABLES'),
                                  use_snappy=settings.get('HBASE_USE_SNAPPY'))
 
     def _init_metadata(self, settings):
-        self._metadata = HBaseMetadata(self.connection, settings.get('HBASE_METADATA_TABLE'),
+        self._metadata = HBaseMetadata(self.connection_kwargs, settings.get('HBASE_METADATA_TABLE'),
                                        settings.get('HBASE_DROP_ALL_TABLES'),
                                        settings.get('HBASE_USE_SNAPPY'),
                                        settings.get('HBASE_BATCH_SIZE'),
                                        settings.get('STORE_CONTENT'))
 
     def _init_domain_metadata(self, settings):
-        self._domain_metadata = DomainCache(settings.get('HBASE_DOMAIN_METADATA_CACHE_SIZE'), self.connection,
+        self._domain_metadata = DomainCache(settings.get('HBASE_DOMAIN_METADATA_CACHE_SIZE'), self.connection_kwargs,
                                             settings.get('HBASE_DOMAIN_METADATA_TABLE'),
                                             batch_size=settings.get('HBASE_DOMAIN_METADATA_BATCH_SIZE'))
 
