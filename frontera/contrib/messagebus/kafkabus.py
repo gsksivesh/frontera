@@ -148,12 +148,14 @@ class SpiderLogStream(BaseSpiderLogStream):
         self._partitions = messagebus.spider_log_partitions
         self._enable_ssl = messagebus.enable_ssl
         self._cert_path = messagebus.cert_path
+        self._kafka_max_block_ms = messagebus.kafka_max_block_ms
 
     def producer(self):
         return KeyedProducer(self._location, self._enable_ssl, self._cert_path, self._topic,
                              FingerprintPartitioner(self._partitions), self._codec,
                              batch_size=DEFAULT_BATCH_SIZE,
-                             buffer_memory=DEFAULT_BUFFER_MEMORY)
+                             buffer_memory=DEFAULT_BUFFER_MEMORY,
+                             max_block_ms=self._kafka_max_block_ms)
 
     def consumer(self, partition_id, type):
         """
@@ -187,6 +189,7 @@ class SpiderFeedStream(BaseSpiderFeedStream):
         self._offset_fetcher = OffsetsFetcherAsync(**kwargs)
         self._codec = messagebus.codec
         self._partitions = messagebus.spider_feed_partitions
+        self._kafka_max_block_ms = messagebus.kafka_max_block_ms
 
     def consumer(self, partition_id):
         c = Consumer(self._location, self._enable_ssl, self._cert_path, self._topic, self._general_group, partition_id)
@@ -207,7 +210,8 @@ class SpiderFeedStream(BaseSpiderFeedStream):
             else FingerprintPartitioner(self._partitions)
         return KeyedProducer(self._location, self._enable_ssl, self._cert_path, self._topic, partitioner, self._codec,
                              batch_size=DEFAULT_BATCH_SIZE,
-                             buffer_memory=DEFAULT_BUFFER_MEMORY)
+                             buffer_memory=DEFAULT_BUFFER_MEMORY,
+                             max_block_ms=self._kafka_max_block_ms)
 
 
 class ScoringLogStream(BaseScoringLogStream):
@@ -218,6 +222,7 @@ class ScoringLogStream(BaseScoringLogStream):
         self._codec = messagebus.codec
         self._cert_path = messagebus.cert_path
         self._enable_ssl = messagebus.enable_ssl
+        self._kafka_max_block_ms = messagebus.kafka_max_block_ms
 
     def consumer(self):
         return Consumer(self._location, self._enable_ssl, self._cert_path, self._topic, self._group, partition_id=None)
@@ -225,7 +230,8 @@ class ScoringLogStream(BaseScoringLogStream):
     def producer(self):
         return SimpleProducer(self._location, self._enable_ssl, self._cert_path, self._topic, self._codec,
                               batch_size=DEFAULT_BATCH_SIZE,
-                              buffer_memory=DEFAULT_BUFFER_MEMORY)
+                              buffer_memory=DEFAULT_BUFFER_MEMORY,
+                              max_block_ms=self._kafka_max_block_ms)
 
 
 class StatsLogStream(ScoringLogStream, BaseStatsLogStream):
@@ -261,6 +267,7 @@ class MessageBus(BaseMessageBus):
         self.cert_path = settings.get('KAFKA_CERT_PATH')
         self.spider_log_partitions = settings.get('SPIDER_LOG_PARTITIONS')
         self.spider_feed_partitions = settings.get('SPIDER_FEED_PARTITIONS')
+        self.kafka_max_block_ms = settings.get('KAFKA_MAX_BLOCK_MS')
 
     def spider_log(self):
         return SpiderLogStream(self)

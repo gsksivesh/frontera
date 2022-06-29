@@ -105,3 +105,4 @@ STATS_LOG_READER_GROUP = 'stats-reader-log'
 KAFKA_CODEC = None
 KAFKA_CERT_PATH = '/mnt/mesos/sandbox'
 KAFKA_ENABLE_SSL = False
+KAFKA_MAX_BLOCK_MS = 60000
