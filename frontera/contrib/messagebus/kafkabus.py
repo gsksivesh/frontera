@@ -2,16 +2,19 @@
 from __future__ import absolute_import
 
 from logging import getLogger
-from os.path import join as os_path_join
+from time import sleep
 
 import six
 from kafka import KafkaConsumer, KafkaProducer, TopicPartition
-from kafka.errors import KafkaTimeoutError
 
 from frontera.contrib.backends.partitioners import FingerprintPartitioner, Crc32NamePartitioner
 from frontera.contrib.messagebus.kafka.offsets_fetcher import OffsetsFetcherAsync
 from frontera.core.messagebus import BaseMessageBus, BaseSpiderLogStream, BaseSpiderFeedStream, \
     BaseStreamConsumer, BaseScoringLogStream, BaseStreamProducer, BaseStatsLogStream
+from twisted.internet.task import LoopingCall
+from traceback import format_tb
+from os.path import join as os_path_join
+
 
 DEFAULT_BATCH_SIZE = 1024 * 1024
 DEFAULT_BUFFER_MEMORY = 130 * 1024 * 1024
@@ -34,7 +37,6 @@ class Consumer(BaseStreamConsumer):
     """
     Used in DB and SW worker. SW consumes per partition.
     """
-
     def __init__(self, location, enable_ssl, cert_path, topic, group, partition_id):
         self._location = location
         self._group = group
@@ -58,8 +60,7 @@ class Consumer(BaseStreamConsumer):
             self._partitions = [TopicPartition(self._topic, partition_id)]
             self._consumer.assign(self._partitions)
         else:
-            self._partitions = [TopicPartition(self._topic, pid) for pid in
-                                self._consumer.partitions_for_topic(self._topic)]
+            self._partitions = [TopicPartition(self._topic, pid) for pid in self._consumer.partitions_for_topic(self._topic)]
             self._consumer.subscribe(topics=[self._topic])
 
     def get_messages(self, timeout=0.1, count=1):
@@ -128,11 +129,7 @@ class KeyedProducer(BaseStreamProducer):
 
     def send(self, key, *messages):
         for msg in messages:
-            try:
-                self._producer.send(self._topic_done, key=key, value=msg)
-            except KafkaTimeoutError:
-                print(f'KafkaTimeoutError message length: {len(msg)}')
-                print(f'KafkaTimeoutError message: {msg}')
+            self._producer.send(self._topic_done, key=key, value=msg)
 
     def flush(self):
         self._producer.flush()
@@ -243,7 +240,6 @@ class StatsLogStream(ScoringLogStream, BaseStatsLogStream):
     The interface is the same as for scoring log stream, so it's better
     to reuse it with proper topic and group.
     """
-
     def __init__(self, messagebus):
         super(StatsLogStream, self).__init__(messagebus)
         self._topic = messagebus.topic_stats
