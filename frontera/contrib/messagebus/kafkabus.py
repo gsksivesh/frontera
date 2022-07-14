@@ -2,7 +2,7 @@
 from __future__ import absolute_import
 
 from logging import getLogger
-from time import sleep
+from os.path import join as os_path_join
 
 import six
 from kafka import KafkaConsumer, KafkaProducer, TopicPartition
@@ -11,10 +11,6 @@ from frontera.contrib.backends.partitioners import FingerprintPartitioner, Crc32
 from frontera.contrib.messagebus.kafka.offsets_fetcher import OffsetsFetcherAsync
 from frontera.core.messagebus import BaseMessageBus, BaseSpiderLogStream, BaseSpiderFeedStream, \
     BaseStreamConsumer, BaseScoringLogStream, BaseStreamProducer, BaseStatsLogStream
-from twisted.internet.task import LoopingCall
-from traceback import format_tb
-from os.path import join as os_path_join
-
 
 DEFAULT_BATCH_SIZE = 1024 * 1024
 DEFAULT_BUFFER_MEMORY = 130 * 1024 * 1024
@@ -33,15 +29,31 @@ def _prepare_kafka_ssl_kwargs(cert_path):
     }
 
 
+def _prepare_kafka_sasl_kwargs(sasl_username, sasl_password):
+    """Prepare SASL kwargs for Kafka producer/consumer."""
+    return {
+        'security_protocol': 'SASL_SSL',
+        'sasl_mechanism': 'SCRAM-SHA-512',
+        'sasl_plain_username': sasl_username,
+        'sasl_plain_password': sasl_password
+    }
+
+
 class Consumer(BaseStreamConsumer):
     """
     Used in DB and SW worker. SW consumes per partition.
     """
-    def __init__(self, location, enable_ssl, cert_path, topic, group, partition_id):
+
+    def __init__(self, location, enable_ssl, cert_path, topic, group, partition_id,
+                 enable_sasl=False, sasl_username='', sasl_password=''):
         self._location = location
         self._group = group
         self._topic = topic
-        kwargs = _prepare_kafka_ssl_kwargs(cert_path) if enable_ssl else {}
+        kwargs = {}
+        if enable_ssl:
+            kwargs = _prepare_kafka_ssl_kwargs(cert_path)
+        elif enable_sasl:
+            kwargs = _prepare_kafka_sasl_kwargs(sasl_username, sasl_password)
         self._consumer = KafkaConsumer(
             bootstrap_servers=self._location,
             group_id=self._group,
@@ -60,7 +72,8 @@ class Consumer(BaseStreamConsumer):
             self._partitions = [TopicPartition(self._topic, partition_id)]
             self._consumer.assign(self._partitions)
         else:
-            self._partitions = [TopicPartition(self._topic, pid) for pid in self._consumer.partitions_for_topic(self._topic)]
+            self._partitions = [TopicPartition(self._topic, pid) for pid in
+                                self._consumer.partitions_for_topic(self._topic)]
             self._consumer.subscribe(topics=[self._topic])
 
     def get_messages(self, timeout=0.1, count=1):
@@ -86,15 +99,20 @@ class Consumer(BaseStreamConsumer):
 
 
 class SimpleProducer(BaseStreamProducer):
-    def __init__(self, location, enable_ssl, cert_path, topic, compression, **kwargs):
+    def __init__(self, location, enable_ssl, cert_path, topic, compression,
+                 enable_sasl=False, sasl_username='', sasl_password='',
+                 **kwargs):
         self._location = location
         self._topic = topic
         self._compression = compression
-        self._create(enable_ssl, cert_path, **kwargs)
+        if enable_ssl:
+            kwargs.update(_prepare_kafka_ssl_kwargs(cert_path))
+        elif enable_sasl:
+            kwargs.update(_prepare_kafka_sasl_kwargs(sasl_username, sasl_password))
+        self._create(**kwargs)
 
-    def _create(self, enable_ssl, cert_path, **kwargs):
+    def _create(self, **kwargs):
         max_request_size = kwargs.pop('max_request_size', DEFAULT_MAX_REQUEST_SIZE)
-        kwargs.update(_prepare_kafka_ssl_kwargs(cert_path) if enable_ssl else {})
         self._producer = KafkaProducer(bootstrap_servers=self._location,
                                        retries=5,
                                        compression_type=self._compression,
@@ -113,13 +131,18 @@ class SimpleProducer(BaseStreamProducer):
 
 
 class KeyedProducer(BaseStreamProducer):
-    def __init__(self, location, enable_ssl, cert_path, topic_done, partitioner, compression, **kwargs):
+    def __init__(self, location, enable_ssl, cert_path, topic_done, partitioner, compression,
+                 enable_sasl=False, sasl_username='', sasl_password='',
+                 **kwargs):
         self._location = location
         self._topic_done = topic_done
         self._partitioner = partitioner
         self._compression = compression
         max_request_size = kwargs.pop('max_request_size', DEFAULT_MAX_REQUEST_SIZE)
-        kwargs.update(_prepare_kafka_ssl_kwargs(cert_path) if enable_ssl else {})
+        if enable_ssl:
+            kwargs.update(_prepare_kafka_ssl_kwargs(cert_path))
+        elif enable_sasl:
+            kwargs.update(_prepare_kafka_sasl_kwargs(sasl_username, sasl_password))
         self._producer = KafkaProducer(bootstrap_servers=self._location,
                                        partitioner=partitioner,
                                        retries=5,
@@ -148,6 +171,9 @@ class SpiderLogStream(BaseSpiderLogStream):
         self._partitions = messagebus.spider_log_partitions
         self._enable_ssl = messagebus.enable_ssl
         self._cert_path = messagebus.cert_path
+        self._enable_sasl = messagebus.enable_sasl
+        self._sasl_username = messagebus.sasl_username
+        self._sasl_password = messagebus.sasl_password
         self._kafka_max_block_ms = messagebus.kafka_max_block_ms
 
     def producer(self):
@@ -155,7 +181,10 @@ class SpiderLogStream(BaseSpiderLogStream):
                              FingerprintPartitioner(self._partitions), self._codec,
                              batch_size=DEFAULT_BATCH_SIZE,
                              buffer_memory=DEFAULT_BUFFER_MEMORY,
-                             max_block_ms=self._kafka_max_block_ms)
+                             max_block_ms=self._kafka_max_block_ms,
+                             enable_sasl=self._enable_sasl,
+                             sasl_username=self._sasl_username,
+                             sasl_password=self._sasl_password)
 
     def consumer(self, partition_id, type):
         """
@@ -165,7 +194,9 @@ class SpiderLogStream(BaseSpiderLogStream):
         :return:
         """
         group = self._sw_group if type == b'sw' else self._db_group
-        c = Consumer(self._location, self._enable_ssl, self._cert_path, self._topic, group, partition_id)
+        c = Consumer(self._location, self._enable_ssl, self._cert_path, self._topic, group, partition_id,
+                     enable_sasl=self._enable_sasl, sasl_username=self._sasl_username,
+                     sasl_password=self._sasl_password)
         assert len(c._consumer.partitions_for_topic(self._topic)) == self._partitions
         return c
 
@@ -179,6 +210,9 @@ class SpiderFeedStream(BaseSpiderFeedStream):
         self._hostname_partitioning = messagebus.hostname_partitioning
         self._enable_ssl = messagebus.enable_ssl
         self._cert_path = messagebus.cert_path
+        self._enable_sasl = messagebus.enable_sasl
+        self._sasl_username = messagebus.sasl_username
+        self._sasl_password = messagebus.sasl_password
         kwargs = {
             'bootstrap_servers': self._location,
             'topic': self._topic,
@@ -186,13 +220,18 @@ class SpiderFeedStream(BaseSpiderFeedStream):
         }
         if self._enable_ssl:
             kwargs.update(_prepare_kafka_ssl_kwargs(self._cert_path))
+        elif self._enable_sasl:
+            kwargs.update(_prepare_kafka_sasl_kwargs(self._sasl_username, self._sasl_password))
         self._offset_fetcher = OffsetsFetcherAsync(**kwargs)
         self._codec = messagebus.codec
         self._partitions = messagebus.spider_feed_partitions
         self._kafka_max_block_ms = messagebus.kafka_max_block_ms
 
     def consumer(self, partition_id):
-        c = Consumer(self._location, self._enable_ssl, self._cert_path, self._topic, self._general_group, partition_id)
+        c = Consumer(self._location, self._enable_ssl, self._cert_path, self._topic, self._general_group,
+                     partition_id,
+                     enable_sasl=self._enable_sasl, sasl_username=self._sasl_username,
+                     sasl_password=self._sasl_password)
         assert len(c._consumer.partitions_for_topic(self._topic)) == self._partitions, \
             "Number of kafka topic partitions doesn't match value in config for spider feed"
         return c
@@ -208,10 +247,13 @@ class SpiderFeedStream(BaseSpiderFeedStream):
     def producer(self):
         partitioner = Crc32NamePartitioner(self._partitions) if self._hostname_partitioning \
             else FingerprintPartitioner(self._partitions)
-        return KeyedProducer(self._location, self._enable_ssl, self._cert_path, self._topic, partitioner, self._codec,
+        return KeyedProducer(self._location, self._enable_ssl, self._cert_path, self._topic, partitioner,
+                             self._codec,
                              batch_size=DEFAULT_BATCH_SIZE,
                              buffer_memory=DEFAULT_BUFFER_MEMORY,
-                             max_block_ms=self._kafka_max_block_ms)
+                             max_block_ms=self._kafka_max_block_ms,
+                             enable_sasl=self._enable_sasl, sasl_username=self._sasl_username,
+                             sasl_password=self._sasl_password)
 
 
 class ScoringLogStream(BaseScoringLogStream):
@@ -222,16 +264,24 @@ class ScoringLogStream(BaseScoringLogStream):
         self._codec = messagebus.codec
         self._cert_path = messagebus.cert_path
         self._enable_ssl = messagebus.enable_ssl
+        self._enable_sasl = messagebus.enable_sasl
+        self._sasl_username = messagebus.sasl_username
+        self._sasl_password = messagebus.sasl_password
         self._kafka_max_block_ms = messagebus.kafka_max_block_ms
 
     def consumer(self):
-        return Consumer(self._location, self._enable_ssl, self._cert_path, self._topic, self._group, partition_id=None)
+        return Consumer(self._location, self._enable_ssl, self._cert_path, self._topic, self._group,
+                        partition_id=None,
+                        enable_sasl=self._enable_sasl, sasl_username=self._sasl_username,
+                        sasl_password=self._sasl_password)
 
     def producer(self):
         return SimpleProducer(self._location, self._enable_ssl, self._cert_path, self._topic, self._codec,
                               batch_size=DEFAULT_BATCH_SIZE,
                               buffer_memory=DEFAULT_BUFFER_MEMORY,
-                              max_block_ms=self._kafka_max_block_ms)
+                              max_block_ms=self._kafka_max_block_ms,
+                              enable_sasl=self._enable_sasl, sasl_username=self._sasl_username,
+                              sasl_password=self._sasl_password)
 
 
 class StatsLogStream(ScoringLogStream, BaseStatsLogStream):
@@ -240,6 +290,7 @@ class StatsLogStream(ScoringLogStream, BaseStatsLogStream):
     The interface is the same as for scoring log stream, so it's better
     to reuse it with proper topic and group.
     """
+
     def __init__(self, messagebus):
         super(StatsLogStream, self).__init__(messagebus)
         self._topic = messagebus.topic_stats
@@ -265,6 +316,9 @@ class MessageBus(BaseMessageBus):
         self.kafka_location = settings.get('KAFKA_LOCATION')
         self.enable_ssl = settings.get('KAFKA_ENABLE_SSL')
         self.cert_path = settings.get('KAFKA_CERT_PATH')
+        self.enable_sasl = settings.get('KAFKA_ENABLE_SASL')
+        self.sasl_username = settings.get('KAFKA_SASL_USERNAME')
+        self.sasl_password = settings.get('KAFKA_SASL_PASSWORD')
         self.spider_log_partitions = settings.get('SPIDER_LOG_PARTITIONS')
         self.spider_feed_partitions = settings.get('SPIDER_FEED_PARTITIONS')
         self.kafka_max_block_ms = settings.get('KAFKA_MAX_BLOCK_MS')
