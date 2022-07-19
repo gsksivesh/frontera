@@ -21,7 +21,7 @@ class OffsetsFetcherAsync(object):
         'session_timeout_ms': 30000,
         'heartbeat_interval_ms': 3000,
         'retry_backoff_ms': 100,
-        'api_version': (0, 9),
+        'api_version': (0, 10),
         'metric_group_prefix': ''
     }
 
